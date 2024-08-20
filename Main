@@ -1,0 +1,438 @@
+import pandas as pd
+import requests
+import json
+import tkinter as tk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
+import logging
+from logging.handlers import RotatingFileHandler
+import time
+import os
+import webbrowser
+
+
+# Настройка логирования
+log_file = "app.log"
+log_handler = RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=2)  # 5 MB per file, 2 backups
+log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+log_handler.setFormatter(log_formatter)
+logging.getLogger().addHandler(log_handler)
+logging.getLogger().setLevel(logging.INFO)
+
+
+class TextHandler(logging.Handler):
+   def __init__(self, text_widget):
+       logging.Handler.__init__(self)
+       self.text_widget = text_widget
+
+
+   def emit(self, record):
+       msg = self.format(record)
+       if len(msg) > 100:
+           msg = msg[:100] + '...'  # Обрезка текста до 100 символов
+       def append():
+           self.text_widget.configure(state='normal')
+           self.text_widget.insert(tk.END, msg + '\n')
+           self.text_widget.configure(state='disabled')
+           self.text_widget.yview(tk.END)
+       self.text_widget.after(0, append)
+
+
+# Глобальная переменная для отслеживания текущего ключа
+current_api_key_index = 0
+
+
+# Функция для получения текущего API ключа
+def get_current_api_key(api_keys):
+   global current_api_key_index
+   api_key = api_keys[current_api_key_index]
+   current_api_key_index = (current_api_key_index + 1) % len(api_keys)
+   return api_key
+
+
+# Функция для рерайта заголовков
+def rewrite_title(title, api_keys, prompt, site_url, app_name, model):
+   global current_api_key_index
+   max_attempts = 3  # Максимальное количество попыток для каждого ключа
+   for _ in range(len(api_keys) * max_attempts):
+       api_key = get_current_api_key(api_keys)
+       try:
+           formatted_prompt = prompt.format(title=title)
+           logging.info(f"Formatted prompt: {formatted_prompt}")
+           response = requests.post(
+               url="https://openrouter.ai/api/v1/chat/completions",
+               headers={
+                   "Authorization": f"Bearer {api_key}",
+                   "HTTP-Referer": f"{site_url}", # Optional
+                   "X-Title": f"{app_name}", # Optional
+               },
+               data=json.dumps({
+                   "model": model,
+                   "messages": [
+                       { "role": "user", "content": formatted_prompt }
+                   ]
+               })
+           )
+           response.raise_for_status()  # Проверка на успешность запроса
+           result = response.json()
+           rewritten_title = result['choices'][0]['message']['content'].strip('"')
+           return rewritten_title.strip('"')
+       except requests.exceptions.RequestException as e:
+           logging.error(f"Request failed with API key {api_key}: {e}")
+           if response.status_code == 429:  # Превышение лимита запросов
+               time.sleep(1)  # Пауза перед переключением на следующий ключ
+               continue  # Переключаемся на следующий ключ
+           return title
+       except ValueError as e:
+           logging.error(f"JSON decode error: {e}")
+           logging.error(f"Response text: {response.text}")
+           return title
+   messagebox.showerror("Ошибка", "Все API ключи не работают. Проверьте ключи и попробуйте снова.")
+   logging.error("All API keys failed.")
+   return None  # Возвращаем None, если все ключи не сработали
+
+
+# Функция для удаления стоп-слов
+def remove_stop_words(text, stop_words):
+   for word in stop_words:
+       text = text.replace(word, "")
+   return text
+
+
+# Функция для обработки CSV файла
+def process_csv(input_file, output_file, api_keys, title_prompt, desc_prompt, site_url, app_name, stop_words, model, progress_bar):
+   logging.info("Starting CSV processing...")
+   try:
+       df = pd.read_csv(input_file)
+       logging.info("CSV file loaded successfully.")
+       total_rows = len(df)
+       progress_bar.pack(pady=10)  # Показать прогресс-бар
+       for i, row in df.iterrows():
+           new_title = rewrite_title(row['title'], api_keys, title_prompt, site_url, app_name, model)
+           new_desc = rewrite_title(row['description'], api_keys, desc_prompt, site_url, app_name, model)
+           if new_title is None or new_desc is None:
+               messagebox.showerror("Ошибка", "Процесс рерайтинга прерван из-за отказа всех API ключей.")
+               logging.error("Rewriting process aborted due to all API keys failing.")
+               progress_bar.pack_forget()  # Скрыть прогресс-бар
+               return
+           df.at[i, 'title'] = remove_stop_words(new_title, stop_words)
+           df.at[i, 'description'] = remove_stop_words(new_desc, stop_words)
+           progress_bar['value'] = (i + 1) / total_rows * 100
+           root.update_idletasks()
+       df.to_csv(output_file, index=False)
+       messagebox.showinfo("Готово", "Файл успешно обработан и сохранен!")
+       logging.info("CSV файл успешно обработан и сохранен.")
+       progress_bar.pack_forget()  # Скрыть прогресс-бар
+   except FileNotFoundError as e:
+       logging.error(f"File not found: {e}")
+       messagebox.showerror("Ошибка", f"Файл не найден: {e}")
+   except pd.errors.EmptyDataError as e:
+       logging.error(f"Empty data error: {e}")
+       messagebox.showerror("Ошибка", "Файл пустой или поврежден.")
+   except Exception as e:
+       logging.error(f"An error occurred: {e}")
+       messagebox.showerror("Ошибка", f"Произошла ошибка: {e}")
+       progress_bar.pack_forget()  # Скрыть прогресс-бар
+
+
+# Функция для выбора входного файла
+def select_input_file(entry):
+   logging.info("Selecting input file...")
+   try:
+       input_file = filedialog.askopenfilename(filetypes=[("CSV files", "*.csv")])
+       entry.delete(0, tk.END)
+       entry.insert(0, input_file)
+       logging.info(f"Selected input file: {input_file}")
+   except Exception as e:
+       logging.error(f"Error selecting input file: {e}")
+       messagebox.showerror("Ошибка", f"Произошла ошибка при выборе входного файла: {e}")
+
+
+# Функция для выбора выходного файла
+def select_output_file(entry):
+   logging.info("Selecting output file...")
+   try:
+       output_file = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
+       entry.delete(0, tk.END)
+       entry.insert(0, output_file)
+       logging.info(f"Selected output file: {output_file}")
+   except Exception as e:
+       logging.error(f"Error selecting output file: {e}")
+       messagebox.showerror("Ошибка", f"Произошла ошибка при выборе выходного файла: {e}")
+
+
+# Функция для сохранения настроек
+def save_settings():
+   settings = {
+       "api_keys": api_keys_entry.get("1.0", tk.END).strip().split('\n'),
+       "site_url": site_url_entry.get(),
+       "app_name": app_name_entry.get(),
+       "model": model_var.get(),
+       "title_prompt": title_prompt_entry.get(),
+       "desc_prompt": desc_prompt_entry.get(),
+       "stop_words": stop_words_entry.get("1.0", tk.END).strip().split('\n')
+   }
+   with open("settings.json", "w") as f:
+       json.dump(settings, f)
+   messagebox.showinfo("Сохранение настроек", "Настройки успешно сохранены.")
+   logging.info("Settings saved successfully.")
+
+
+# Функция для загрузки настроек
+def load_settings():
+   if os.path.exists("settings.json"):
+       with open("settings.json", "r") as f:
+           settings = json.load(f)
+       api_keys_entry.delete("1.0", tk.END)
+       api_keys_entry.insert("1.0", "\n".join(settings["api_keys"]))
+       site_url_entry.delete(0, tk.END)
+       site_url_entry.insert(0, settings["site_url"])
+       app_name_entry.delete(0, tk.END)
+       app_name_entry.insert(0, settings["app_name"])
+       model_var.set(settings["model"])
+       title_prompt_entry.delete(0, tk.END)
+       title_prompt_entry.insert(0, settings["title_prompt"])
+       desc_prompt_entry.delete(0, tk.END)
+       desc_prompt_entry.insert(0, settings["desc_prompt"])
+       stop_words_entry.delete("1.0", tk.END)
+       stop_words_entry.insert("1.0", "\n".join(settings["stop_words"]))
+   logging.info("Settings loaded successfully.")
+
+
+# Функция для фильтрации и сортировки строк в CSV файле
+def filter_and_sort_csv(input_file, output_file, filter_conditions, sort_column, sort_order):
+   logging.info("Starting CSV filtering and sorting...")
+   try:
+       df = pd.read_csv(input_file)
+       logging.info("CSV file loaded successfully.")
+
+
+       # Применение условий фильтрации
+       for column, value in filter_conditions.items():
+           df = df[df[column] >= value]
+
+
+       # Сортировка
+       df = df.sort_values(by=sort_column, ascending=(sort_order == "ascending"))
+
+
+       # Сохранение отфильтрованного и отсортированного файла
+       df.to_csv(output_file, index=False)
+
+
+       # Показ количества строк
+       row_count = len(df)
+       messagebox.showinfo("Готово", f"Файл успешно отфильтрован и сохранен! Количество строк: {row_count}")
+       logging.info(f"CSV файл успешно отфильтрован и сохранен. Количество строк: {row_count}")
+   except FileNotFoundError as e:
+       logging.error(f"File not found: {e}")
+       messagebox.showerror("Ошибка", f"Файл не найден: {e}")
+   except pd.errors.EmptyDataError as e:
+       logging.error(f"Empty data error: {e}")
+       messagebox.showerror("Ошибка", "Файл пустой или поврежден.")
+   except Exception as e:
+       logging.error(f"An error occurred: {e}")
+       messagebox.showerror("Ошибка", f"Произошла ошибка: {e}")
+
+
+
+
+# Создание графического интерфейса
+root = tk.Tk()
+root.title("CSV Rewriter")
+
+
+tab_control = ttk.Notebook(root)
+api_tab = ttk.Frame(tab_control)
+filter_tab = ttk.Frame(tab_control)
+file_tab = ttk.Frame(tab_control)
+log_tab = ttk.Frame(tab_control)
+tab_control.add(api_tab, text='API Settings')
+tab_control.add(filter_tab, text='Filter & Sort Settings')
+tab_control.add(file_tab, text='File Settings')
+tab_control.add(log_tab, text='Logs')
+tab_control.grid(row=0, column=0, padx=10, pady=10, sticky='nsew')
+
+
+# Вкладка API Settings
+tk.Label(api_tab, text="API Keys (по одному в строке):").grid(row=0, column=0, padx=10, pady=10)
+api_keys_entry = scrolledtext.ScrolledText(api_tab, width=50, height=5)
+api_keys_entry.grid(row=0, column=1, padx=10, pady=10)
+
+
+tk.Label(api_tab, text="HTTP Referer (Site URL):").grid(row=1, column=0, padx=10, pady=10)
+site_url_entry = tk.Entry(api_tab, width=50)
+site_url_entry.grid(row=1, column=1, padx=10, pady=10)
+
+
+tk.Label(api_tab, text="X-Title (App Name):").grid(row=2, column=0, padx=10, pady=10)
+app_name_entry = tk.Entry(api_tab, width=50)
+app_name_entry.grid(row=2, column=1, padx=10, pady=10)
+
+
+tk.Label(api_tab, text="Модель API:").grid(row=3, column=0, padx=10, pady=10)
+model_var = tk.StringVar(value="meta-llama/llama-3.1-8b-instruct:free")
+model_menu = ttk.Combobox(api_tab, textvariable=model_var, values=[
+   "nousresearch/hermes-3-llama-3.1-405b",
+   "meta-llama/llama-3.1-8b-instruct:free"
+])
+model_menu.grid(row=3, column=1, padx=10, pady=10)
+
+
+
+
+# Гиперссылка
+def open_link(event):
+   webbrowser.open_new("https://valvepress.com/how-to-generate-an-openrouter-api-key-for-wordpress-automatic-plugin/")
+
+
+
+
+link_frame = tk.Frame(api_tab)
+link_frame.grid(row=4, column=0, columnspan=2, padx=10, pady=10, sticky='w')
+tk.Label(link_frame, text="Посмотрите ").pack(side='left')
+link_label = tk.Label(link_frame, text="это руководство", fg="blue", cursor="hand2")
+link_label.pack(side='left')
+link_label.bind("<Button-1>", open_link)
+tk.Label(link_frame, text=" о том, как получить ключ OpenRouter API").pack(side='left')
+
+
+# Вкладка Filter & Sort Settings
+tk.Label(filter_tab, text="Входной файл:").grid(row=0, column=0, padx=10, pady=10)
+filter_input_entry = tk.Entry(filter_tab, width=50)
+filter_input_entry.grid(row=0, column=1, padx=10, pady=10)
+tk.Button(filter_tab, text="Выбрать", command=lambda: select_input_file(filter_input_entry)).grid(row=0, column=2,
+                                                                                                 padx=10, pady=10)
+
+
+tk.Label(filter_tab, text="Выходной файл:").grid(row=1, column=0, padx=10, pady=10)
+filter_output_entry = tk.Entry(filter_tab, width=50)
+filter_output_entry.grid(row=1, column=1, padx=10, pady=10)
+tk.Button(filter_tab, text="Выбрать", command=lambda: select_output_file(filter_output_entry)).grid(row=1, column=2,
+                                                                                                   padx=10, pady=10)
+
+
+tk.Label(filter_tab, text="Колонка для фильтрации:").grid(row=2, column=0, padx=10, pady=10)
+filter_column_entry = tk.Entry(filter_tab, width=50)
+filter_column_entry.grid(row=2, column=1, padx=10, pady=10)
+
+
+tk.Label(filter_tab, text="Значение для фильтрации:").grid(row=3, column=0, padx=10, pady=10)
+filter_value_entry = tk.Entry(filter_tab, width=50)
+filter_value_entry.grid(row=3, column=1, padx=10, pady=10)
+
+
+tk.Label(filter_tab, text="Колонка для сортировки:").grid(row=4, column=0, padx=10, pady=10)
+sort_column_entry = tk.Entry(filter_tab, width=50)
+sort_column_entry.grid(row=4, column=1, padx=10, pady=10)
+
+
+tk.Label(filter_tab, text="Порядок сортировки:").grid(row=5, column=0, padx=10, pady=10)
+sort_order_var = tk.StringVar(value="ascending")
+sort_order_menu = ttk.Combobox(filter_tab, textvariable=sort_order_var, values=["ascending", "descending"])
+sort_order_menu.grid(row=5, column=1, padx=10, pady=10)
+
+
+tk.Button(filter_tab, text="Фильтровать и сортировать", command=lambda: filter_and_sort_csv(
+   filter_input_entry.get(),
+   filter_output_entry.get(),
+   {filter_column_entry.get(): int(filter_value_entry.get())},
+   sort_column_entry.get(),
+   sort_order_var.get()
+)).grid(row=6, column=0, columnspan=3, padx=10, pady=10)
+
+
+# Вкладка File Settings
+tk.Label(file_tab, text="Входной файл:").grid(row=0, column=0, padx=10, pady=10)
+input_entry = tk.Entry(file_tab, width=50)
+input_entry.grid(row=0, column=1, padx=10, pady=10)
+tk.Button(file_tab, text="Выбрать", command=lambda: select_input_file(input_entry)).grid(row=0, column=2, padx=10,
+                                                                                        pady=10)
+
+
+tk.Label(file_tab, text="Выходной файл:").grid(row=1, column=0, padx=10, pady=10)
+output_entry = tk.Entry(file_tab, width=50)
+output_entry.grid(row=1, column=1, padx=10, pady=10)
+tk.Button(file_tab, text="Выбрать", command=lambda: select_output_file(output_entry)).grid(row=1, column=2, padx=10,
+                                                                                          pady=10)
+
+
+tk.Label(file_tab, text="Промт для title:").grid(row=2, column=0, padx=10, pady=10)
+title_prompt_entry = tk.Entry(file_tab, width=50)
+title_prompt_entry.grid(row=2, column=1, padx=10, pady=10)
+
+
+tk.Label(file_tab, text="Промт для description:").grid(row=3, column=0, padx=10, pady=10)
+desc_prompt_entry = tk.Entry(file_tab, width=50)
+desc_prompt_entry.grid(row=3, column=1, padx=10, pady=10)
+
+
+tk.Label(file_tab, text="Стоп-слова:").grid(row=4, column=0, padx=10, pady=10)
+stop_words_entry = scrolledtext.ScrolledText(file_tab, width=50, height=5)
+stop_words_entry.grid(row=4, column=1, padx=10, pady=10)
+
+
+# Прогресс-бар (уменьшенный на треть и центрированный)
+progress_frame = tk.Frame(file_tab)
+progress_frame.grid(row=5, column=0, columnspan=3, padx=10, pady=10)
+progress_bar = ttk.Progressbar(progress_frame, orient="horizontal", length=267, mode="determinate")
+
+
+# Кнопка "Обработать"
+process_button = tk.Button(file_tab, text="Обработать", command=lambda: process_csv(
+   input_entry.get(),
+   output_entry.get(),
+   api_keys_entry.get("1.0", tk.END).splitlines(),
+   title_prompt_entry.get(),
+   desc_prompt_entry.get(),
+   site_url_entry.get(),
+   app_name_entry.get(),
+   stop_words_entry.get("1.0", tk.END).splitlines(),
+   model_var.get(),
+   progress_bar
+) if validate_inputs() else None)
+process_button.grid(row=6, column=0, columnspan=3, padx=10, pady=10)
+
+
+# Вкладка Logs
+log_text = scrolledtext.ScrolledText(log_tab, state='disabled', width=80, height=20)
+log_text.grid(row=0, column=0, padx=10, pady=10)
+text_handler = TextHandler(log_text)
+logging.getLogger().addHandler(text_handler)
+logging.getLogger().setLevel(logging.INFO)
+
+
+# Кнопки для сохранения и загрузки настроек
+save_button = tk.Button(root, text="Сохранить настройки", command=save_settings)
+save_button.grid(row=7, column=0, padx=10, pady=10)
+load_button = tk.Button(root, text="Загрузить настройки", command=load_settings)
+load_button.grid(row=8, column=0, padx=10, pady=10)
+
+
+# Загрузка логов из файла при запуске
+def load_logs():
+   logging.info("Loading logs...")
+   if os.path.exists(log_file):
+       try:
+           with open(log_file, "r") as f:
+               log_text.configure(state='normal')
+               log_text.insert(tk.END, f.read())
+               log_text.configure(state='disabled')
+       except Exception as e:
+           logging.error(f"Error loading logs: {e}")
+           messagebox.showerror("Ошибка", f"Произошла ошибка при загрузке логов: {e}")
+
+
+# Валидация входных данных
+def validate_inputs():
+   if not input_entry.get() or not output_entry.get():
+       messagebox.showerror("Ошибка", "Пожалуйста, выберите входной и выходной файлы.")
+       return False
+   if not api_keys_entry.get("1.0", tk.END).strip():
+       messagebox.showerror("Ошибка", "Пожалуйста, введите хотя бы один API ключ.")
+       return False
+   return True
+
+
+load_logs()
+load_settings()
+root.mainloop()
